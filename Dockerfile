@@ -1,12 +1,14 @@
 FROM golang:1.17-alpine
 
+RUN apk add openssl
+
 WORKDIR /app
 
-COPY go.mod .
+COPY . .
 
-COPY main.go .
+RUN ./init.sh
 
-RUN go build -o proxy
+RUN go build -o /app/proxy main.go
 
 cmd ["/app/proxy"]
 
