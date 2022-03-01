@@ -1,28 +1,24 @@
 package main
 
 import (
-	"crypto/tls"
 	"errors"
-	"flag"
 	"fmt"
 	"github.com/google/uuid"
+	"github.com/sirupsen/logrus"
+	"homework_security/db"
+	"homework_security/repeater"
+	"homework_security/utils"
 	"io"
 	"log"
 	"net"
 	"net/http"
+	"net/http/httputil"
+	"os"
 	"time"
 )
 
-type proxy struct {
-}
-
-func copyHeaders(to, from http.Header) {
-	for h, vv := range from {
-		for _, v := range vv {
-			to.Add(h, v)
-		}
-	}
-}
+const reqDumpErr = "Request dump error: "
+const dbConnectErr = "Can't connect to database"
 
 func connectHandshake(w http.ResponseWriter, r *http.Request) (net.Conn, error) {
 	conn, err := net.DialTimeout("tcp", r.Host, 10*time.Second)
@@ -58,9 +54,21 @@ func transfer(dest io.WriteCloser, src io.ReadCloser) {
 	io.Copy(dest, src)
 }
 
-func handleHTTPS(w http.ResponseWriter, r *http.Request) {
+func handleHTTPS(w http.ResponseWriter, r *http.Request, dbConn *db.Database) {
 	connectID := uuid.New()
 	fmt.Println("HTTPS Connect", connectID, r.Method, r.URL)
+
+	reqDump, err := httputil.DumpRequest(r, true)
+	if err != nil {
+		logrus.Warn(reqDumpErr, err.Error())
+	}
+
+	dbReq := db.Request{
+		Host:    "https://" + r.Host,
+		Request: string(reqDump),
+	}
+
+	dbConn.InsertRequest(dbReq)
 
 	destConn, err := connectHandshake(w, r)
 	if err != nil {
@@ -82,11 +90,12 @@ func handleHTTPS(w http.ResponseWriter, r *http.Request) {
 
 	go transfer(destConn, srcConn)
 	go transfer(srcConn, destConn)
+	dbConn.Close()
 
 	fmt.Println("HTTPS open transfer", connectID)
 }
 
-func handleHTTP(w http.ResponseWriter, r *http.Request) {
+func handleHTTP(w http.ResponseWriter, r *http.Request, dbConn *db.Database) {
 	connectID := uuid.New()
 	fmt.Println("HTTP Connect", connectID, r.Method, r.URL)
 
@@ -97,6 +106,17 @@ func handleHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	r.RequestURI = ""
 
+	reqDump, err := httputil.DumpRequest(r, true)
+	if err != nil {
+		logrus.Warn(reqDumpErr, err.Error())
+	}
+
+	dbReq := db.Request{
+		Host:    "http://" + r.Host,
+		Request: string(reqDump),
+	}
+	dbConn.InsertRequest(dbReq)
+
 	resp, err := client.Do(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -106,52 +126,46 @@ func handleHTTP(w http.ResponseWriter, r *http.Request) {
 
 	fmt.Println("HTTP Response", connectID, resp.Status)
 
-	copyHeaders(w.Header(), resp.Header)
+	utils.CopyHeaders(w.Header(), resp.Header)
 
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
 
+	dbConn.Close()
+
 	fmt.Println("HTTP Close", connectID)
 }
 
-func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	dbConn, err := db.CreateNewDatabaseConnection()
+	if err != nil {
+		logrus.Fatal(dbConnectErr, err.Error())
+	}
+
 	if r.Method == http.MethodConnect {
-		handleHTTPS(w, r)
+		handleHTTPS(w, r, dbConn)
 	} else {
-		handleHTTP(w, r)
+		handleHTTP(w, r, dbConn)
 	}
 }
 
 func main() {
-	var addr = flag.String("addr", "0.0.0.0:8080", "The addr of the application.")
-	var proto = flag.String("proto", "http", "Application protocol")
-	var cert = flag.String("cert", "./certs/root.pem", "Cert file location")
-	var key = flag.String("key", "./certs/root.key", "Key file location")
-	flag.Parse()
-
-	p := &proxy{}
-
-	log.Println("Starting proxy server on", *addr)
-	server := http.Server{
-		Addr:         *addr,
-		Handler:      p,
-		TLSNextProto: make(map[string]func(*http.Server, *tls.Conn, http.Handler)),
+	proxyPort := "8080"
+	if port := os.Getenv("PROXY_PORT"); len(port) != 0 {
+		proxyPort = port
+	}
+	dashboardPort := "80"
+	if port := os.Getenv("DASHBOARD_PORT"); len(port) != 0 {
+		dashboardPort = port
 	}
 
-	switch *proto {
-	case "http":
-		if err := server.ListenAndServe(); err != nil {
-			log.Fatalf(err.Error())
-		}
-
-		break
-	case "https":
-		if err := server.ListenAndServeTLS(*cert, *key); err != nil {
-			log.Fatalf(err.Error())
-		}
-
-		break
-	default:
-		log.Fatal("select http or https")
+	server := &http.Server{
+		Addr:    ":" + proxyPort,
+		Handler: http.HandlerFunc(ServeHTTP),
 	}
+
+	http.HandleFunc("/req", repeater.ExecRepReq)
+
+	go http.ListenAndServe(":"+dashboardPort, nil)
+	logrus.Fatal(server.ListenAndServe())
 }
